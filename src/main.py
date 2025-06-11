@@ -91,13 +91,20 @@ class SecureFileTransfer:
             metadata_bytes = f"{metadata.filename}:{metadata.size}:{metadata.checksum}".encode()
             signature = self.auth.sign_data(metadata_bytes)
             
-            # Veriyi paketlere bol
-            print("Veri paketlere bolunuyor...")
-            packets = self.packet_handler.fragment_data(encrypted_data, "0.0.0.0", dst_ip)
+            # Veriyi gönder
+            print("Veri gönderiliyor...")
+            # Bağlantıyı kur
+            if not self.packet_handler.connect_to_host(dst_ip, dst_port):
+                print("Hedefe bağlantı kurulamadı.")
+                return False
+
+            # Tek bilgisayar testi için kaynak IP'yi ayarla (TCP için doğrudan kullanılmayacak olsa da argüman olarak bırakıldı)
+            sender_ip = "127.0.0.1" if dst_ip == "127.0.0.1" else "0.0.0.0"
+            # TCP tabanlı olduğu için fragment_data artık sadece veriyi döndürüyor
+            data_to_send = self.packet_handler.fragment_data(encrypted_data, sender_ip, dst_ip, dst_port) # Bu çağrı artık sadece encrypted_data'yı döndürecek
             
-            # Paketleri gonder
-            print(f"Toplam {len(packets)} paket gonderiliyor...")
-            if self.packet_handler.send_packets(packets, dst_ip, dst_port):
+            print(f"Toplam {len(data_to_send)} bayt veri gonderiliyor...")
+            if self.packet_handler.send_packets(data_to_send):
                 print("Dosya basariyla gonderildi!")
                 return True
             else:
@@ -109,9 +116,9 @@ class SecureFileTransfer:
             return False
         
         finally:
-            self.packet_handler.close()
+            self.packet_handler.close() # Soketleri kapat
     
-    def receive_file(self, output_dir: str, password: str, timeout: int = 30):
+    def receive_file(self, output_dir: str, password: str, timeout: int = 30, listen_port: int = 5000):
         """
         Dosyayi guvenli bir sekilde alir.
         
@@ -124,27 +131,38 @@ class SecureFileTransfer:
             output_dir: Alinan dosyalarin kaydedilecegi dizin
             password: Sifreleme anahtari
             timeout: Paket bekleme suresi (saniye)
+            listen_port: Dinleme portu (varsayılan: 5000)
             
         Returns:
             bool: Islem basarili ise True, degilse False
         """
         try:
             print("Paketler bekleniyor...")
+            # Dinlemeye başla ve bağlantıyı kabul et
+            if not self.packet_handler.start_listening(listen_port, timeout):
+                print(f"[{listen_port}] portunda dinleme başlatılamadı.")
+                return False
+            
+            if not self.packet_handler.accept_connection(timeout):
+                print("Bağlantı kabul edilemedi veya zaman aşımı.")
+                return False
+
+            # Meta veri paketlerini al (artık listen_port doğrudan receive_packets'e geçmiyor)
             packets = self.packet_handler.receive_packets(timeout)
             
             if not packets:
                 print("Hic paket alinamadi!")
                 return False
             
-            # Paketleri birlestir
-            print("Paketler birlestiriliyor...")
-            encrypted_data = self.packet_handler.reassemble_packets(packets)
+            # Paketleri birlestir (TCP'de buna gerek kalmadı, receive_packets zaten tüm veriyi döner)
+            # encrypted_data = self.packet_handler.reassemble_packets(packets)
+            encrypted_data = packets # packets artık doğrudan alınan veri (bytes) olacak
             
             if not encrypted_data:
                 print("Paketler birlestirilemedi!")
                 return False
             
-            # Dosyayi kaydet
+            # Dosyayı kaydet
             print("Dosya kaydediliyor...")
             metadata = FileMetadata(
                 filename="received_file",  # Gercek uygulamada meta veriler ayri bir pakette gonderilmeli
@@ -164,7 +182,7 @@ class SecureFileTransfer:
             return False
         
         finally:
-            self.packet_handler.close()
+            self.packet_handler.close() # Soketleri kapat
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Güvenli Dosya Transfer Sistemi')
@@ -175,6 +193,7 @@ def parse_args():
     parser.add_argument('--dst-port', type=int, default=5000, help='Hedef port (varsayılan: 5000)')
     parser.add_argument('--output-dir', default='received_files', help='Alınan dosyaların kaydedileceği dizin')
     parser.add_argument('--password', required=False, help='Şifre (GUI modunda opsiyonel)')
+    parser.add_argument('--listen-port', type=int, default=5000, help='Dinleme portu (varsayılan: 5000)')
     return parser.parse_args()
 
 def main():
@@ -216,7 +235,7 @@ def main():
             app.send_file(args.file, args.dst_ip, args.dst_port, args.password)
         
         else:  # receive mode
-            app.receive_file(args.output_dir, args.password)
+            app.receive_file(args.output_dir, args.password, args.listen_port)
 
 if __name__ == "__main__":
     main() 

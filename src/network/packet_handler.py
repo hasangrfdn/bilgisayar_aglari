@@ -14,239 +14,199 @@ Kullanim:
 """
 
 import socket
-import struct
 import time
 from typing import List, Tuple, Optional, Dict
-from scapy.all import IP, TCP, Raw, fragment, ICMP, send, sr1
 
 class PacketHandler:
     """
-    IP paket isleme ve manipülasyon sinifi.
-    
-    Bu sinif, ag paketlerinin olusturulmasi, gonderilmesi ve alinmasi
-    islemlerini yonetir. Raw socket kullanarak dusuk seviyeli ag
-    islemleri yapar.
+    TCP tabanlı ağ paket işleme sınıfı.
+
+    Bu sınıf, ağ paketlerinin gönderilmesi ve alınması
+    işlemlerini yönetir. Standart TCP soketleri kullanarak
+    güvenli ve güvenilir iletişim sağlar.
     """
-    
-    def __init__(self, mtu: int = 1500):
+
+    def __init__(self):
+        """PacketHandler sınıfını başlatır."""
+        self._send_socket: Optional[socket.socket] = None
+        self._listen_socket: Optional[socket.socket] = None
+        self._conn_socket: Optional[socket.socket] = None
+
+    def fragment_data(self, data: bytes, src_ip: str, dst_ip: str, dst_port: int) -> bytes:
         """
-        PacketHandler sinifini baslatir.
-        
-        Args:
-            mtu: Maximum Transmission Unit (byte)
+        TCP için bu metot, veriyi olduğu gibi döndürür.
+        Parçalama TCP stack'i tarafından yapılır.
         """
-        self.mtu = mtu
-        self._socket = None
-    
-    def _create_ip_header(self, src_ip: str, dst_ip: str, ttl: int = 64) -> IP:
+        return data
+
+    def reassemble_packets(self, data: bytes) -> Optional[bytes]:
         """
-        IP basligi olusturur.
-        
-        Args:
-            src_ip: Kaynak IP adresi
-            dst_ip: Hedef IP adresi
-            ttl: Time To Live degeri
-            
-        Returns:
-            IP: Scapy IP paketi
+        TCP'de veri akışı olduğu için, bu metot sadece gelen veriyi döndürür.
         """
-        return IP(
-            src=src_ip,
-            dst=dst_ip,
-            ttl=ttl,
-            flags=0,  # Normal paket
-            id=int(time.time() * 1000) & 0xFFFF  # Benzersiz ID
-        )
-    
-    def _create_tcp_header(self, src_port: int, dst_port: int, seq: int = 0) -> TCP:
+        return data
+
+    def _send_bytes_with_length(self, sock: socket.socket, data: bytes) -> None:
         """
-        TCP basligi olusturur.
-        
-        Args:
-            src_port: Kaynak port numarasi
-            dst_port: Hedef port numarasi
-            seq: Sira numarasi
-            
-        Returns:
-            TCP: Scapy TCP paketi
+        Veriyi, 4 baytlık uzunluk ön ekiyle birlikte gönderir.
         """
-        return TCP(
-            sport=src_port,
-            dport=dst_port,
-            seq=seq,
-            flags="S",  # SYN flag
-            window=65535
-        )
-    
-    def _calculate_checksum(self, data: bytes) -> int:
+        data_length = len(data)
+        sock.sendall(data_length.to_bytes(4, 'big'))
+        sock.sendall(data)
+
+    def _receive_bytes_with_length(self, sock: socket.socket, timeout: int) -> Optional[bytes]:
         """
-        IP basligi icin checksum hesaplar.
-        
-        Args:
-            data: Checksum hesaplanacak veri
-            
-        Returns:
-            int: 16-bit checksum degeri
+        Veriyi, 4 baytlık uzunluk ön ekiyle birlikte alır.
         """
-        if len(data) % 2 == 1:
-            data += b'\0'
-        
-        words = struct.unpack('!%dH' % (len(data) // 2), data)
-        checksum = sum(words)
-        
-        while checksum >> 16:
-            checksum = (checksum & 0xFFFF) + (checksum >> 16)
-        
-        return ~checksum & 0xFFFF
-    
-    def fragment_data(self, data: bytes, src_ip: str, dst_ip: str) -> List[IP]:
-        """
-        Veriyi IP paketlerine boler.
-        
-        Islem adimlari:
-        1. IP ve TCP basliklarini olusturur
-        2. Veriyi pakete ekler
-        3. MTU'ya gore paketi parcalar
-        
-        Args:
-            data: Parcalanacak veri
-            src_ip: Kaynak IP adresi
-            dst_ip: Hedef IP adresi
-            
-        Returns:
-            List[IP]: Parcalanmis IP paketleri listesi
-        """
-        # IP ve TCP basliklarini olustur
-        ip = self._create_ip_header(src_ip, dst_ip)
-        tcp = self._create_tcp_header(12345, 12345)  # Ornek portlar
-        
-        # Veriyi paketlere ekle
-        packet = ip/tcp/Raw(load=data)
-        
-        # Paketi parcala
-        fragments = fragment(packet, fragsize=self.mtu - 40)  # 40 = IP + TCP baslik boyutu
-        return fragments
-    
-    def reassemble_packets(self, packets: List[IP]) -> Optional[bytes]:
-        """
-        Parcalanmis paketleri birlestirir.
-        
-        Islem adimlari:
-        1. Paketleri siraya dizer
-        2. Tum parcalarin geldigini kontrol eder
-        3. Veriyi birlestirir
-        
-        Args:
-            packets: Birlestirilecek paketler listesi
-            
-        Returns:
-            Optional[bytes]: Birlestirilmis veri veya None
-        """
-        if not packets:
+        sock.settimeout(timeout)
+        length_bytes = sock.recv(4)
+        if not length_bytes:
             return None
-        
-        # Paketleri siraya diz
-        sorted_packets = sorted(packets, key=lambda x: x.frag)
-        
-        # Tum parcalarin geldigini kontrol et
-        if not all(p.flags & 0x2 == 0 for p in sorted_packets[:-1]):
-            return None
-        
-        # Veriyi birlestir
-        reassembled_data = b''
-        for packet in sorted_packets:
-            if Raw in packet:
-                reassembled_data += packet[Raw].load
-        
-        return reassembled_data
-    
-    def send_packets(self, packets: List[IP], dst_ip: str, dst_port: int) -> bool:
+        data_length = int.from_bytes(length_bytes, 'big')
+
+        received_data = b''
+        bytes_received = 0
+        while bytes_received < data_length:
+            chunk = sock.recv(min(data_length - bytes_received, 4096))
+            if not chunk:
+                break
+            received_data += chunk
+            bytes_received += len(chunk)
+
+        return received_data
+
+    def connect_to_host(self, dst_ip: str, dst_port: int, timeout: int = 5) -> bool:
         """
-        Paketleri gonderir.
-        
-        Args:
-            packets: Gonderilecek paketler listesi
-            dst_ip: Hedef IP adresi
-            dst_port: Hedef port numarasi
-            
-        Returns:
-            bool: Islem basarili ise True, degilse False
+        Belirtilen hedefe TCP bağlantısı kurar.
         """
+        print(f"[PacketHandler] Bağlantı kurulmaya çalışılıyor: {dst_ip}:{dst_port}")
         try:
-            if not self._socket:
-                self._socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_RAW)
-                self._socket.setsockopt(socket.IPPROTO_IP, socket.IP_HDRINCL, 1)
-            
-            for packet in packets:
-                self._socket.sendto(bytes(packet), (dst_ip, dst_port))
-                time.sleep(0.01)  # Paketler arasi kucuk gecikme
-            
+            self._send_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._send_socket.settimeout(timeout)
+            self._send_socket.connect((dst_ip, dst_port))
+            print(f"[PacketHandler] [{dst_ip}:{dst_port}] hedefine bağlantı kuruldu.")
             return True
         except Exception as e:
-            print(f"Paket gonderme hatasi: {e}")
+            print(f"[PacketHandler] Bağlantı hatası: {e}")
+            self._send_socket = None
             return False
-    
-    def receive_packets(self, timeout: int = 5) -> List[IP]:
+
+    def send_packets(self, data: bytes) -> bool:
         """
-        Paketleri alir.
-        
-        Args:
-            timeout: Paket bekleme suresi (saniye)
-            
-        Returns:
-            List[IP]: Alinan paketler listesi
+        Önceden kurulmuş TCP bağlantısı üzerinden veriyi gönderir.
         """
+        print(f"[PacketHandler] Gönderme işlemi başlatıldı. Veri uzunluğu: {len(data)} bayt.")
+        if not self._send_socket:
+            print("[PacketHandler] Gönderme soketi bağlı değil.")
+            return False
+
         try:
-            if not self._socket:
-                self._socket = socket.socket(socket.AF_INET, socket.SOCK_RAW, socket.IPPROTO_IP)
-                self._socket.bind(('0.0.0.0', 0))
-            
-            self._socket.settimeout(timeout)
-            packets = []
-            
-            while True:
-                try:
-                    data, addr = self._socket.recvfrom(65535)
-                    packet = IP(data)
-                    packets.append(packet)
-                except socket.timeout:
-                    break
-            
-            return packets
+            self._send_bytes_with_length(self._send_socket, data)
+            print(f"[PacketHandler] TCP üzerinden {len(data)} bayt veri gönderildi.")
+            return True
         except Exception as e:
-            print(f"Paket alma hatasi: {e}")
-            return []
-    
+            print(f"[PacketHandler] Paket gönderme hatası: {e}")
+            return False
+
+    def start_listening(self, listen_port: int, timeout: int = 5) -> bool:
+        """
+        Belirtilen portta TCP dinlemeye başlar.
+        """
+        print(f"[PacketHandler] Dinlemeye başlanıyor: {listen_port} portunda.")
+        try:
+            self._listen_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._listen_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._listen_socket.bind(('', listen_port))
+            self._listen_socket.listen(1)
+            self._listen_socket.settimeout(timeout)
+            print(f"[PacketHandler] [{listen_port}] portunda dinlemeye başlandı.")
+            return True
+        except Exception as e:
+            print(f"[PacketHandler] Dinleme hatası: {e}")
+            self._listen_socket = None
+            return False
+
+    def accept_connection(self, timeout: int = 5) -> bool:
+        """
+        Dinleme soketi üzerinde gelen bir bağlantıyı kabul eder.
+        """
+        print("[PacketHandler] Bağlantı kabul edilmesi bekleniyor...")
+        if not self._listen_socket:
+            print("[PacketHandler] Dinleme soketi başlatılmadı.")
+            return False
+
+        try:
+            print("[PacketHandler] accept() çağrılıyor...")
+            self._conn_socket, addr = self._listen_socket.accept()
+            self._conn_socket.settimeout(timeout)
+            print(f"[PacketHandler] Bağlantı kabul edildi: {addr}")
+            return True
+        except socket.timeout:
+            print(f"[PacketHandler] Bağlantı kabul etme zaman aşımı: {timeout} saniye.")
+            self._conn_socket = None
+            return False
+        except Exception as e:
+            print(f"[PacketHandler] Bağlantı kabul hatası: {e}")
+            self._conn_socket = None
+            return False
+
+    def receive_packets(self, timeout: int = 5) -> Optional[bytes]:
+        """
+        Kabul edilmiş TCP bağlantısı üzerinden veriyi alır.
+        """
+        print(f"[PacketHandler] Veri alımı başlatıldı. Zaman aşımı: {timeout} saniye.")
+        if not self._conn_socket:
+            print("[PacketHandler] Bağlantı soketi yok.")
+            return None
+
+        try:
+            received_data = self._receive_bytes_with_length(self._conn_socket, timeout)
+            if received_data is None:
+                print("[PacketHandler] Veri alınamadı veya bağlantı kapandı.")
+                return None
+            print(f"[PacketHandler] Toplam {len(received_data)} bayt veri alındı.")
+            return received_data
+        except socket.timeout:
+            print(f"[PacketHandler] Veri alma zaman aşımı: {timeout} saniye.")
+            return None
+        except Exception as e:
+            print(f"[PacketHandler] Paket alma hatası: {e}")
+            return None
+
     def close(self):
-        """Socket baglantisini kapatir."""
-        if self._socket:
-            self._socket.close()
-            self._socket = None
+        """
+        Tüm açık soket bağlantılarını kapatır.
+        """
+        print("[PacketHandler] Soketler kapatılıyor...")
+        if self._send_socket:
+            self._send_socket.close()
+            self._send_socket = None
+            print("[PacketHandler] Gönderme soketi kapatıldı.")
+        if self._conn_socket:
+            self._conn_socket.close()
+            self._conn_socket = None
+            print("[PacketHandler] Bağlantı soketi kapatıldı.")
+        if self._listen_socket:
+            self._listen_socket.close()
+            self._listen_socket = None
+            print("[PacketHandler] Dinleme soketi kapatıldı.")
 
     def send_test_packet(self, dst_ip: str, dst_port: int, ttl: int = 64, flags: str = "DF") -> bool:
         """
-        Test amacli IP paketi gonderir.
-        
-        Args:
-            dst_ip: Hedef IP adresi
-            dst_port: Hedef port numarasi
-            ttl: Time To Live degeri
-            flags: IP bayraklari
-            
-        Returns:
-            bool: Islem basarili ise True, degilse False
+        Test amaçlı bir TCP paketi gönderir (Scapy bağımlılığı kaldırıldığı için bu metot basitleştirildi).
         """
+        temp_socket = None
         try:
-            # Test paketi olustur
-            packet = IP(dst=dst_ip, ttl=ttl, flags=flags)/TCP(dport=dst_port)/b"TEST"
-            
-            # Paketi gonder
-            send(packet, verbose=0)
+            temp_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            temp_socket.connect((dst_ip, dst_port))
+            self._send_bytes_with_length(temp_socket, b"TEST_PACKET")
+            print(f"Test paketi {dst_ip}:{dst_port} adresine gönderildi.")
             return True
-            
         except Exception as e:
-            print(f"Test paketi gonderme hatasi: {e}")
+            print(f"Test paketi gönderme hatası: {e}")
             return False
+        finally:
+            if temp_socket:
+                temp_socket.close()
 
     def test_connection(self, dst_ip: str, dst_port: int) -> Dict:
         """

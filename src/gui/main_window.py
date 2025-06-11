@@ -17,6 +17,8 @@ Kullanim:
 import os
 import sys
 import time
+import json
+import base64
 from typing import Optional, Dict, Any
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -27,7 +29,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont, QIcon
 
-from src.core.file_transfer import FileTransfer
+from src.core.file_transfer import FileTransfer, FileMetadata
 from src.network.packet_handler import PacketHandler
 from src.security.auth import Authentication
 from src.gui.performance_window import PerformanceWindow
@@ -55,16 +57,22 @@ class TransferThread(QThread):
     transfer_completed = pyqtSignal(str)
     error_occurred = pyqtSignal(str)
     
-    def __init__(self, mode: str, **kwargs):
+    def __init__(self, mode: str, file_transfer_instance: FileTransfer, packet_handler_instance: PacketHandler, auth_instance: Authentication, **kwargs):
         """
         TransferThread sinifini baslatir.
         
         Args:
             mode: Transfer modu ('send' veya 'receive')
+            file_transfer_instance: Dosya transfer nesnesi
+            packet_handler_instance: Paket işlemleri nesnesi
+            auth_instance: Güvenlik işlemleri nesnesi
             **kwargs: Transfer parametreleri
         """
         super().__init__()
         self.mode = mode
+        self.file_transfer = file_transfer_instance
+        self.packet_handler = packet_handler_instance
+        self.auth = auth_instance
         self.kwargs = kwargs
         self.is_running = True
     
@@ -92,43 +100,133 @@ class TransferThread(QThread):
         2. Dosyayi hazirlar ve gonderir
         3. Ilerleme durumunu raporlar
         """
-        transfer = FileTransfer(
-            self.kwargs['src_file'],
-            self.kwargs['dst_ip'],
-            self.kwargs['dst_port'],
-            self.kwargs['password']
-        )
-        
-        def progress_callback(progress: int):
-            if self.is_running:
-                self.progress_updated.emit(progress)
-        
-        transfer.send_file(progress_callback)
-        self.transfer_completed.emit("Dosya basariyla gonderildi")
+        src_file = self.kwargs['src_file']
+        dst_ip = self.kwargs['dst_ip']
+        dst_port = self.kwargs['dst_port']
+        password = self.kwargs['password']
+
+        try:
+            # 1. Dosyayı şifrele ve meta verilerini al
+            metadata, encrypted_data = self.file_transfer.prepare_file(src_file, password)
+            
+            # 2. Meta verilerini JSON'a dönüştür ve kodla
+            metadata_json = json.dumps({
+                "filename": metadata.filename,
+                "size": metadata.size,
+                "checksum": metadata.checksum,
+                "encryption_key": base64.urlsafe_b64encode(metadata.encryption_key).decode('utf-8'),
+                "iv": base64.urlsafe_b64encode(metadata.iv).decode('utf-8')
+            }).encode('utf-8')
+
+            # 3. Meta verilerini parçala ve gönder
+            local_ip = "127.0.0.1" 
+            
+            # Bağlantıyı kur
+            if not self.packet_handler.connect_to_host(dst_ip, dst_port):
+                raise Exception("Hedefe bağlantı kurulamadı.")
+
+            metadata_to_send = self.packet_handler.fragment_data(metadata_json, local_ip, dst_ip, dst_port)
+            self.packet_handler.send_packets(metadata_to_send)
+
+            # Küçük bir bekleme, meta verilerin önce ulaşmasını sağlamak için
+            time.sleep(0.1) 
+            
+            # 4. Şifrelenmiş veriyi gönder
+            data_to_send = self.packet_handler.fragment_data(encrypted_data, local_ip, dst_ip, dst_port)
+
+            total_bytes = len(data_to_send)
+            bytes_sent_so_far = 0
+            chunk_size = 4096 # Örneğin 4KB'lik parçalar halinde ilerleme gösterelim
+
+            # İlerleme çubuğunu güncellemek için
+            while bytes_sent_so_far < total_bytes:
+                if not self.is_running:
+                    break
+                
+                current_chunk = data_to_send[bytes_sent_so_far : bytes_sent_so_far + chunk_size]
+                
+                # Sadece ilerleme için, gerçek gönderme PacketHandler içinde
+                self.progress_updated.emit(int((bytes_sent_so_far + len(current_chunk)) / total_bytes * 100))
+                bytes_sent_so_far += len(current_chunk)
+                time.sleep(0.001) # Çok hızlı olmamak için küçük bir bekleme
+
+            success = self.packet_handler.send_packets(data_to_send)
+            if not success:
+                raise Exception("Dosya gönderme başarısız oldu.")
+            
+            self.transfer_completed.emit("Dosya başarıyla gönderildi")
+
+        except Exception as e:
+            self.error_occurred.emit(f"Gönderme hatası: {e}")
+        finally:
+            self.packet_handler.close() # Soketleri kapat
     
     def _receive_file(self):
         """
-        Dosya alma islemini gerceklestirir.
+        Dosya alma işlemini gerçekleştirir.
         
-        Islem adimlari:
-        1. Dosya transfer nesnesini olusturur
-        2. Dosyayi alir ve kaydeder
-        3. Ilerleme durumunu raporlar
+        İşlem adımları:
+        1. Dosya transfer nesnesini oluşturur
+        2. Dosyayı alır ve kaydeder
+        3. İlerleme durumunu raporlar
         """
-        transfer = FileTransfer(
-            output_dir=self.kwargs['output_dir'],
-            password=self.kwargs['password']
-        )
-        
-        def progress_callback(progress: int):
-            if self.is_running:
-                self.progress_updated.emit(progress)
-        
-        transfer.receive_file(
-            self.kwargs['listen_port'],
-            progress_callback
-        )
-        self.transfer_completed.emit("Dosya basariyla alindi")
+        listen_port = self.kwargs['listen_port']
+        password = self.kwargs['password']
+        output_dir = self.kwargs['output_dir']
+
+        try:
+            print(f"[{listen_port}] portunda dinlemeye başlanıyor...")
+            # Dinlemeye başla ve bağlantıyı kabul et
+            if not self.packet_handler.start_listening(listen_port, timeout=30):
+                raise Exception(f"[{listen_port}] portunda dinleme başlatılamadı.")
+            
+            print("Bağlantı kabul edilmesi bekleniyor...")
+            if not self.packet_handler.accept_connection(timeout=30):
+                raise Exception("Bağlantı kabul edilemedi veya zaman aşımı.")
+
+            print("Meta veri paketleri bekleniyor...")
+            # 1. Önce meta veri paketlerini al
+            # İlk başta kısa bir süre meta veriler için dinle
+            metadata_bytes = self.packet_handler.receive_packets(timeout=10)
+            if not metadata_bytes:
+                raise Exception("Meta veri paketleri alınamadı veya zaman aşımı!")
+            
+            print("Meta veriler alındı, dosya verileri bekleniyor...")
+            metadata_dict = json.loads(metadata_bytes.decode('utf-8'))
+            
+            # Metadata'yı FileMetadata objesine dönüştür
+            metadata = FileMetadata(
+                filename=metadata_dict["filename"],
+                size=metadata_dict["size"],
+                checksum=metadata_dict["checksum"],
+                encryption_key=base64.urlsafe_b64decode(metadata_dict["encryption_key"]),
+                iv=base64.urlsafe_b64decode(metadata_dict["iv"])
+            )
+
+            # 2. Sonra dosya veri paketlerini al
+            # Metadata alındıktan sonra daha uzun süre dosya için dinle
+            encrypted_data = self.packet_handler.receive_packets(timeout=120)
+            if not encrypted_data:
+                raise Exception("Dosya veri paketleri alınamadı veya zaman aşımı!")
+            print("Dosya verileri alındı.")
+            
+            # 3. Dosyayı kaydet ve şifresini çöz
+            final_output_path = self.file_transfer.save_file(encrypted_data, metadata, output_dir)
+            
+            # Kaydedilen şifreli dosyayı çöz
+            decrypted_data = self.file_transfer.decrypt_file(final_output_path, metadata)
+            
+            # Çözülmüş veriyi tekrar orjinal dosya adıyla kaydet (veya geçici bir isimle)
+            decrypted_filepath = os.path.join(output_dir, f"decrypted_{metadata.filename}")
+            with open(decrypted_filepath, 'wb') as f:
+                f.write(decrypted_data)
+            
+            self.transfer_completed.emit(f"Dosya başarıyla alındı ve çözüldü: {decrypted_filepath}")
+
+        except Exception as e:
+            self.error_occurred.emit(f"Alma hatası: {e}")
+        finally:
+            self.packet_handler.close() # Soketleri kapat
     
     def stop(self):
         """
@@ -155,6 +253,11 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle("Guvenli Dosya Transfer Sistemi")
         self.setMinimumSize(800, 600)
+        
+        # Ana bileşenlerin örneklerini oluştur
+        self.file_transfer = FileTransfer()
+        self.packet_handler = PacketHandler()
+        self.auth = Authentication()
         
         # Ana widget ve layout
         main_widget = QWidget()
@@ -319,36 +422,43 @@ class MainWindow(QMainWindow):
         2. Transfer thread'ini baslatir
         3. Arayuzu gunceller
         """
-        if not self.file_path.text():
-            QMessageBox.warning(self, "Hata", "Lutfen bir dosya secin")
-            return
-        
-        if not self.dst_ip.text():
-            QMessageBox.warning(self, "Hata", "Lutfen hedef IP adresini girin")
-            return
-        
-        if not self.password.text():
-            QMessageBox.warning(self, "Hata", "Lutfen sifre girin")
-            return
-        
-        self.send_btn.setEnabled(False)
-        self.receive_btn.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.status_label.setText("Dosya gonderiliyor...")
-        
-        self.transfer_thread = TransferThread(
-            'send',
-            src_file=self.file_path.text(),
-            dst_ip=self.dst_ip.text(),
-            dst_port=self.dst_port.value(),
-            password=self.password.text()
-        )
-        
-        self.transfer_thread.progress_updated.connect(self._update_progress)
-        self.transfer_thread.transfer_completed.connect(self._transfer_completed)
-        self.transfer_thread.error_occurred.connect(self._transfer_error)
-        self.transfer_thread.start()
+        try:
+            file_path = self.file_path.text()
+            dst_ip = self.dst_ip.text()
+            dst_port = self.dst_port.value()
+            password = self.password.text()
+
+            if not file_path or not dst_ip or not password:
+                QMessageBox.warning(self, "Hata", "Lutfen tum alanlari doldurun.")
+                return
+            
+            # Onceki thread'i durdur
+            if self.transfer_thread and self.transfer_thread.isRunning():
+                self.transfer_thread.stop()
+                self.transfer_thread.wait()
+
+            self.transfer_thread = TransferThread(
+                'send',
+                self.file_transfer,
+                self.packet_handler,
+                self.auth,
+                src_file=file_path,
+                dst_ip=dst_ip,
+                dst_port=dst_port,
+                password=password
+            )
+            self.transfer_thread.progress_updated.connect(self._update_progress)
+            self.transfer_thread.transfer_completed.connect(self._transfer_completed)
+            self.transfer_thread.error_occurred.connect(self._transfer_error)
+            self.transfer_thread.start()
+            self.send_btn.setEnabled(False)
+            self.receive_btn.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.status_label.setText("Dosya gonderiliyor...")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya gonderme baslatilamadi: {e}")
+            print(f"Dosya gonderme baslatma hatasi: {e}") # Debug print
     
     def _receive_file(self):
         """
@@ -359,103 +469,104 @@ class MainWindow(QMainWindow):
         2. Transfer thread'ini baslatir
         3. Arayuzu gunceller
         """
-        if not self.receive_password.text():
-            QMessageBox.warning(self, "Hata", "Lutfen sifre girin")
-            return
-        
-        self.send_btn.setEnabled(False)
-        self.receive_btn.setEnabled(False)
-        self.progress_bar.setVisible(True)
-        self.progress_bar.setValue(0)
-        self.status_label.setText("Dosya aliniyor...")
-        
-        self.transfer_thread = TransferThread(
-            'receive',
-            listen_port=self.listen_port.value(),
-            output_dir=self.output_dir.text(),
-            password=self.receive_password.text()
-        )
-        
-        self.transfer_thread.progress_updated.connect(self._update_progress)
-        self.transfer_thread.transfer_completed.connect(self._transfer_completed)
-        self.transfer_thread.error_occurred.connect(self._transfer_error)
-        self.transfer_thread.start()
+        try:
+            listen_port = self.listen_port.value()
+            password = self.receive_password.text()
+            output_dir = self.output_dir.text()
+
+            if not password or not output_dir:
+                QMessageBox.warning(self, "Hata", "Lutfen sifre ve kayit klasorunu doldurun.")
+                return
+            
+            # Onceki thread'i durdur
+            if self.transfer_thread and self.transfer_thread.isRunning():
+                self.transfer_thread.stop()
+                self.transfer_thread.wait()
+
+            self.transfer_thread = TransferThread(
+                'receive',
+                self.file_transfer,
+                self.packet_handler,
+                self.auth,
+                listen_port=listen_port,
+                output_dir=output_dir,
+                password=password
+            )
+            self.transfer_thread.progress_updated.connect(self._update_progress)
+            self.transfer_thread.transfer_completed.connect(self._transfer_completed)
+            self.transfer_thread.error_occurred.connect(self._transfer_error)
+            self.transfer_thread.start()
+            self.send_btn.setEnabled(False)
+            self.receive_btn.setEnabled(False)
+            self.progress_bar.setValue(0)
+            self.status_label.setText("Dosya bekleniyor...")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Hata", f"Dosya alma baslatilamadi: {e}")
+            print(f"Dosya alma baslatma hatasi: {e}") # Debug print
     
     def _update_progress(self, value: int):
         """
-        Ilerleme cubugunu gunceller.
-        
-        Args:
-            value: Yeni ilerleme degeri (0-100)
+        Transfer ilerleme durumunu gunceller.
         """
         self.progress_bar.setValue(value)
+        self.status_label.setText(f"Ilerleme: %{value}")
     
     def _transfer_completed(self, message: str):
         """
-        Transfer tamamlandiginda arayuzu gunceller.
-        
-        Args:
-            message: Tamamlanma mesaji
+        Transfer tamamlandiginda calisir.
         """
+        QMessageBox.information(self, "Bilgi", message)
+        self.status_label.setText(message)
         self.send_btn.setEnabled(True)
         self.receive_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.status_label.setText(message)
-        QMessageBox.information(self, "Bilgi", message)
+        self.progress_bar.setValue(100)
+        if self.transfer_thread: # Stop thread explicitly if not already stopped
+            self.transfer_thread.stop()
+            self.transfer_thread.wait()
     
     def _transfer_error(self, error: str):
         """
-        Transfer hatasi durumunda arayuzu gunceller.
-        
-        Args:
-            error: Hata mesaji
+        Transfer sirasinda hata olustugunda calisir.
         """
+        QMessageBox.critical(self, "Hata", error)
+        self.status_label.setText(f"Hata: {error}")
         self.send_btn.setEnabled(True)
         self.receive_btn.setEnabled(True)
-        self.progress_bar.setVisible(False)
-        self.status_label.setText(f"Hata: {error}")
-        QMessageBox.critical(self, "Hata", error)
+        self.progress_bar.setValue(0)
+        if self.transfer_thread: # Stop thread explicitly if not already stopped
+            self.transfer_thread.stop()
+            self.transfer_thread.wait()
     
     def _test_connection(self):
         """
-        Baglanti testi islemini gerceklestirir.
-        
-        Islem adimlari:
-        1. Gerekli alanlarin dolu oldugunu kontrol eder
-        2. Baglanti testini gerceklestirir
-        3. Sonuclari gosterir
+        Baglanti testi islemini baslatir.
         """
-        if not self.test_ip.text():
-            QMessageBox.warning(self, "Hata", "Lutfen IP adresini girin")
+        target_ip = self.test_ip.text()
+        target_port = self.test_port.value()
+
+        if not target_ip:
+            QMessageBox.warning(self, "Hata", "Lutfen hedef IP adresini girin.")
             return
         
-        self.test_btn.setEnabled(False)
-        self.test_result.clear()
-        self.test_result.append("Baglanti testi yapiliyor...")
-        
         try:
-            handler = PacketHandler()
-            result = handler.test_connection(
-                self.test_ip.text(),
-                self.test_port.value()
-            )
+            self.test_status_label.setText("Baglanti test ediliyor...")
+            result = self.packet_handler.test_connection(target_ip, target_port)
             
-            self.test_result.append("\nTest Sonuclari:")
-            self.test_result.append(f"Baglanti Durumu: {'Basarili' if result['success'] else 'Basarisiz'}")
-            self.test_result.append(f"Gecikme: {result['latency']:.2f} ms")
-            self.test_result.append(f"Paket Kaybi: {result['packet_loss']:.1f}%")
-            
-            if result['success']:
-                self.test_result.append("\nBaglanti detaylari:")
-                self.test_result.append(f"Yerel IP: {result['local_ip']}")
-                self.test_result.append(f"Yerel Port: {result['local_port']}")
-                self.test_result.append(f"Uzak IP: {result['remote_ip']}")
-                self.test_result.append(f"Uzak Port: {result['remote_port']}")
-            
+            status = result.get("status", "BILINMIYOR")
+            message = result.get("message", "Bilinmeyen hata.")
+            ping_avg = result.get("ping_avg_ms", "N/A")
+            packet_loss = result.get("packet_loss_percent", "N/A")
+
+            if status == "BASARILI":
+                self.test_status_label.setText(f"Baglanti basarili! Ping: {ping_avg} ms, Paket Kaybi: {packet_loss}%")
+            else:
+                self.test_status_label.setText(f"Baglanti basarisiz: {message}")
+                
         except Exception as e:
-            self.test_result.append(f"\nHata: {str(e)}")
-        finally:
-            self.test_btn.setEnabled(True)
+            QMessageBox.critical(self, "Hata", f"Baglanti testi sirasinda hata: {e}")
+            self.test_status_label.setText(f"Hata: {e}")
+            print(f"Baglanti testi hatasi: {e}") # Debug print
     
     def _show_performance_window(self):
         """
