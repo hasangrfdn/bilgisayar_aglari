@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Proje özel
+keys/
+received/
+*.log
+secure_file_transfer.egg-info/
+dist/
+build/
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.der
+*.cer
+.env
+*.env
+config.ini
+secrets.json
+
+# Sistem
+.DS_Store
+Thumbs.db
